@@ -2,6 +2,7 @@ import argparse
 import logging
 
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 from pyspark.sql.types import (
     DoubleType, IntegerType, StringType, StructField, StructType, TimestampType
 )
@@ -15,6 +16,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("hiveplace.pipeline")
+
 
 # ---------------------------------------------------------------------------
 # Schema explícito
@@ -33,6 +35,7 @@ RAW_SCHEMA = StructType([
     StructField("trip_duration",      IntegerType(),   True),
 ])
 
+
 # ---------------------------------------------------------------------------
 # Argumentos CLI
 # ---------------------------------------------------------------------------
@@ -43,6 +46,7 @@ def parse_args():
     parser.add_argument("--output-agg",   required=True, help="Diretório saída agregada (Parquet)")
     parser.add_argument("--output-report",default="reports", help="Diretório do relatório JSON")
     return parser.parse_args()
+
 
 # ---------------------------------------------------------------------------
 # Spark Session
@@ -69,6 +73,50 @@ def read_raw(spark: SparkSession, path: str):
         .csv(path)
     )
 
+
+# ---------------------------------------------------------------------------
+# Padronização de nomes
+# ---------------------------------------------------------------------------
+def standardize_columns(df):
+    rename_map = {
+        "id":                 "id_corrida",
+        "vendor_id":          "cd_fornecedor",
+        "pickup_datetime":    "ts_embarque",
+        "dropoff_datetime":   "ts_desembarque",
+        "passenger_count":    "qt_passageiro",
+        "pickup_longitude":   "lg_embarque",
+        "pickup_latitude":    "lt_embarque",
+        "dropoff_longitude":  "lg_desembarque",
+        "dropoff_latitude":   "lt_desembarque",
+        "store_and_fwd_flag": "in_armazenamento_envio",
+        "trip_duration":      "te_duracao_segundo",
+    }
+    for old, new in rename_map.items():
+        if old in df.columns:
+            df = df.withColumnRenamed(old, new)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Regras de qualidade
+# ---------------------------------------------------------------------------
+def get_discard_rules():
+    return {
+        "ts_embarque_nulo":           F.col("ts_embarque").isNull(),
+        "ts_desembarque_nulo":        F.col("ts_desembarque").isNull(),
+        "duracao_nula_ou_negativa":   (F.col("te_duracao_segundo") <= 0) | F.col("te_duracao_segundo").isNull(),
+        "passageiros_invalidos":      (F.col("qt_passageiro") <= 0) | F.col("qt_passageiro").isNull(),
+        "desembarque_antes_embarque": F.col("ts_desembarque") <= F.col("ts_embarque"),
+    }
+
+
+def tag_records(df):
+    expr = F.lit(None).cast(StringType())
+    for reason, condition in get_discard_rules().items():
+        expr = F.when(condition, F.lit(reason)).otherwise(expr)
+    return df.withColumn("_motivo_descarte", expr)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -79,6 +127,13 @@ def main():
     raw_df = read_raw(spark, args.input)
     total  = raw_df.cache().count()
     log.info(f"Total lido: {total:,} registros")
+
+    df = standardize_columns(raw_df)
+    df = tag_records(df)
+
+    log.info("Schema após padronização:")
+    df.printSchema()
+    df.show(5, truncate=False)
 
     spark.stop()
     log.info("Pipeline finalizado.")
