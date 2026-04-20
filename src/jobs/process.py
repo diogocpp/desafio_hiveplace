@@ -1,5 +1,8 @@
 import argparse
+import json
 import logging
+import os
+from datetime import datetime
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -73,7 +76,6 @@ def read_raw(spark: SparkSession, path: str):
         .csv(path)
     )
 
-
 # ---------------------------------------------------------------------------
 # Padronização de nomes
 # ---------------------------------------------------------------------------
@@ -96,7 +98,6 @@ def standardize_columns(df):
             df = df.withColumnRenamed(old, new)
     return df
 
-
 # ---------------------------------------------------------------------------
 # Regras de qualidade
 # ---------------------------------------------------------------------------
@@ -109,13 +110,11 @@ def get_discard_rules():
         "desembarque_antes_embarque": F.col("ts_desembarque") <= F.col("ts_embarque"),
     }
 
-
 def tag_records(df):
     expr = F.lit(None).cast(StringType())
     for reason, condition in get_discard_rules().items():
         expr = F.when(condition, F.lit(reason)).otherwise(expr)
     return df.withColumn("_motivo_descarte", expr)
-
 
 # ---------------------------------------------------------------------------
 # Colunas derivadas
@@ -123,18 +122,27 @@ def tag_records(df):
 def add_derived_columns(df):
     return (
         df
-        .withColumn("te_duracao_minuto",
-            F.round(F.col("te_duracao_segundo") / 60.0, 4))
-        .withColumn("hh_embarque",
-            F.hour("ts_embarque"))
-        .withColumn("dt_embarque",
-            F.to_date("ts_embarque"))
-        .withColumn("in_corrida_longa",
-            F.when(F.col("te_duracao_minuto") > 30, True).otherwise(False))
-        .withColumn("in_armazenamento_envio",
-            F.when(F.col("in_armazenamento_envio") == "Y", True).otherwise(False))
+        .withColumn(
+            "te_duracao_minuto",
+            F.round(F.col("te_duracao_segundo") / 60.0, 4)
+        )
+        .withColumn(
+            "hh_embarque",
+            F.hour("ts_embarque")
+        )
+        .withColumn(
+            "dt_embarque",
+            F.to_date("ts_embarque")
+        )
+        .withColumn(
+            "in_corrida_longa",
+            F.when(F.col("te_duracao_minuto") > 30, True).otherwise(False)
+        )
+        .withColumn(
+            "in_armazenamento_envio",
+            F.when(F.col("in_armazenamento_envio") == "Y", True).otherwise(False)
+        )
     )
-
 
 # ---------------------------------------------------------------------------
 # Agregação analítica
@@ -160,6 +168,93 @@ def build_aggregation(df):
         .orderBy("dt_embarque", "hh_embarque")
     )
 
+# ---------------------------------------------------------------------------
+# Relatório
+# ---------------------------------------------------------------------------
+def generate_report(
+    spark: SparkSession,
+    total: int,
+    validos: int,
+    persistidos_clean: int,
+    persistidos_agg: int,
+    invalid_df,
+    output_path: str,
+):
+    integridade_ok = validos == persistidos_clean
+    total_descartados = total - validos
+
+    motivos_df = (
+        invalid_df
+        .groupBy("_motivo_descarte")
+        .count()
+        .withColumnRenamed("_motivo_descarte", "motivo")
+        .withColumnRenamed("count", "quantidade")
+    )
+
+    # persiste o breakdown como Parquet para auditoria
+    breakdown_path = os.path.join(output_path, "descartados_por_motivo")
+    motivos_df.write.mode("overwrite").parquet(breakdown_path)
+    log.info(f"Breakdown de descartados salvo em: {breakdown_path}")
+
+    # lê de volta para logar — toLocalIterator é seguro para DataFrames pequenos e não carrega tudo na memória do driver de uma vez
+    descartados_log = {}
+    for row in motivos_df.toLocalIterator():
+        descartados_log[row["motivo"]] = row["quantidade"]
+
+    # -----------------------------------
+    # monta e salva o JSON do relatório
+    # -----------------------------------
+    report = {
+        "gerado_em": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S") + " UTC",
+        "pipeline":  "hiveplace-batch-v1",
+        "resumo_registros": {
+            "total_lido":               total,
+            "validos_processados":      validos,
+            "total_descartados":        total_descartados,
+            "persistidos_camada_clean": persistidos_clean,
+            "persistidos_camada_agg":   persistidos_agg,
+        },
+        "descartados_por_motivo": descartados_log,
+        "validacao_integridade": {
+            "validos_igual_persistidos": integridade_ok,
+            "status":  "APROVADO" if integridade_ok else "REPROVADO",
+            "detalhe": (
+                "Todos os registros válidos foram persistidos com sucesso."
+                if integridade_ok
+                else f"Divergência: {validos} válidos x {persistidos_clean} persistidos."
+            ),
+        },
+    }
+
+    os.makedirs(output_path, exist_ok=True)
+    filename = f"relatorio_pipeline_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    filepath = os.path.join(output_path, filename)
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+
+    # -------------------------------------------------------------------
+    # exibe no log
+    # -------------------------------------------------------------------
+    log.info("=" * 60)
+    log.info("RELATÓRIO FINAL DO PIPELINE")
+    log.info("=" * 60)
+    log.info(f"  Gerado em               : {report['gerado_em']}")
+    log.info(f"  Total lido              : {total:,}")
+    log.info(f"  Válidos processados     : {validos:,}")
+    log.info(f"  Total descartados       : {total_descartados:,}")
+    log.info(f"  Persistidos (clean)     : {persistidos_clean:,}")
+    log.info(f"  Persistidos (agg)       : {persistidos_agg:,}")
+    log.info("  Descartados por motivo  :")
+    for motivo, qtd in descartados_log.items():
+        log.info(f"    - {motivo}: {qtd:,}")
+    log.info(f"  Integridade             : {report['validacao_integridade']['status']}")
+    log.info(f"  Detalhe                 : {report['validacao_integridade']['detalhe']}")
+    log.info("=" * 60)
+    log.info(f"  Relatório salvo em      : {filepath}")
+    log.info("=" * 60)
+
+    return report
 
 # ---------------------------------------------------------------------------
 # Main
@@ -196,7 +291,7 @@ def main():
     # 6. Colunas derivadas
     clean_df = add_derived_columns(valid_df)
 
-    # 7. Escrita camada clean
+    # 7. Escrita — camada clean
     log.info("Escrevendo camada clean...")
     (
         clean_df
@@ -205,19 +300,29 @@ def main():
         .partitionBy("dt_embarque")
         .parquet(args.output_clean)
     )
-    persistidos_clean = spark.read.parquet(args.output_clean).count()
-    log.info(f"Registros persistidos (clean): {persistidos_clean:,}")
 
-    # 8. Agregação
+    # 8. Validação de integridade
+    persistidos_clean = spark.read.parquet(args.output_clean).count()
+
+    # 9. Agregação
     log.info("Escrevendo camada agregada...")
     agg_df = build_aggregation(clean_df)
     agg_df.write.mode("overwrite").parquet(args.output_agg)
     persistidos_agg = spark.read.parquet(args.output_agg).count()
-    log.info(f"Registros persistidos (agg): {persistidos_agg:,}")
+
+    # 10. Relatório
+    generate_report(
+        spark=spark,
+        total=total,
+        validos=validos,
+        persistidos_clean=persistidos_clean,
+        persistidos_agg=persistidos_agg,
+        invalid_df=invalid_df,
+        output_path=args.output_report,
+    )
 
     spark.stop()
-    log.info("Pipeline finalizado.")
-
+    log.info("Pipeline finalizado com sucesso.")
 
 if __name__ == "__main__":
     main()
