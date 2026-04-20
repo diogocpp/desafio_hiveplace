@@ -124,16 +124,32 @@ def main():
     args  = parse_args()
     spark = create_spark()
 
+    # 1. Leitura
     raw_df = read_raw(spark, args.input)
     total  = raw_df.cache().count()
     log.info(f"Total lido: {total:,} registros")
 
+    # 2. Padronização
     df = standardize_columns(raw_df)
-    df = tag_records(df)
 
-    log.info("Schema após padronização:")
-    df.printSchema()
-    df.show(5, truncate=False)
+    # 3. Remoção de duplicados
+    df = df.dropDuplicates([
+        "ts_embarque", "ts_desembarque",
+        "lg_embarque", "lt_embarque",
+        "lg_desembarque", "lt_desembarque",
+    ])
+
+    # 4. Classificação de qualidade
+    df = tag_records(df).cache()
+
+    # 5. Separação válidos x descartados
+    valid_df   = df.filter(F.col("_motivo_descarte").isNull()).drop("_motivo_descarte")
+    invalid_df = df.filter(F.col("_motivo_descarte").isNotNull())
+
+    validos = valid_df.count()
+    log.info(f"Válidos: {validos:,} | Descartados: {total - validos:,}")
+    log.info(f"Amostra de descartados:")
+    invalid_df.show(5, truncate=False)
 
     spark.stop()
     log.info("Pipeline finalizado.")
