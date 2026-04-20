@@ -137,6 +137,31 @@ def add_derived_columns(df):
 
 
 # ---------------------------------------------------------------------------
+# Agregação analítica
+# ---------------------------------------------------------------------------
+def build_aggregation(df):
+    return (
+        df
+        .groupBy("dt_embarque", "hh_embarque")
+        .agg(
+            F.count("*")
+             .alias("qt_corrida_total"),
+            F.round(F.avg("te_duracao_minuto"), 2)
+             .alias("vl_media_duracao_minuto"),
+            F.sum(F.when(F.col("in_corrida_longa"), 1).otherwise(0))
+             .alias("qt_corrida_longa"),
+            F.round(
+                F.sum(F.when(F.col("in_corrida_longa"), 1).otherwise(0))
+                / F.count("*"), 4
+            ).alias("pe_corrida_longa"),
+            F.round(F.avg("qt_passageiro"), 2)
+             .alias("vl_media_passageiro"),
+        )
+        .orderBy("dt_embarque", "hh_embarque")
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -180,9 +205,15 @@ def main():
         .partitionBy("dt_embarque")
         .parquet(args.output_clean)
     )
-
     persistidos_clean = spark.read.parquet(args.output_clean).count()
     log.info(f"Registros persistidos (clean): {persistidos_clean:,}")
+
+    # 8. Agregação
+    log.info("Escrevendo camada agregada...")
+    agg_df = build_aggregation(clean_df)
+    agg_df.write.mode("overwrite").parquet(args.output_agg)
+    persistidos_agg = spark.read.parquet(args.output_agg).count()
+    log.info(f"Registros persistidos (agg): {persistidos_agg:,}")
 
     spark.stop()
     log.info("Pipeline finalizado.")
