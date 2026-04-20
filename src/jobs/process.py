@@ -118,6 +118,25 @@ def tag_records(df):
 
 
 # ---------------------------------------------------------------------------
+# Colunas derivadas
+# ---------------------------------------------------------------------------
+def add_derived_columns(df):
+    return (
+        df
+        .withColumn("te_duracao_minuto",
+            F.round(F.col("te_duracao_segundo") / 60.0, 4))
+        .withColumn("hh_embarque",
+            F.hour("ts_embarque"))
+        .withColumn("dt_embarque",
+            F.to_date("ts_embarque"))
+        .withColumn("in_corrida_longa",
+            F.when(F.col("te_duracao_minuto") > 30, True).otherwise(False))
+        .withColumn("in_armazenamento_envio",
+            F.when(F.col("in_armazenamento_envio") == "Y", True).otherwise(False))
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -148,8 +167,22 @@ def main():
 
     validos = valid_df.count()
     log.info(f"Válidos: {validos:,} | Descartados: {total - validos:,}")
-    log.info(f"Amostra de descartados:")
-    invalid_df.show(5, truncate=False)
+
+    # 6. Colunas derivadas
+    clean_df = add_derived_columns(valid_df)
+
+    # 7. Escrita camada clean
+    log.info("Escrevendo camada clean...")
+    (
+        clean_df
+        .write
+        .mode("overwrite")
+        .partitionBy("dt_embarque")
+        .parquet(args.output_clean)
+    )
+
+    persistidos_clean = spark.read.parquet(args.output_clean).count()
+    log.info(f"Registros persistidos (clean): {persistidos_clean:,}")
 
     spark.stop()
     log.info("Pipeline finalizado.")
