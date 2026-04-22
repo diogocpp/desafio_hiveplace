@@ -18,16 +18,6 @@ Pipeline batch em **PySpark** para processamento e análise do dataset **NYC Tax
 - **Apache Spark** 3.5.3 (utilizado no desenvolvimento)
 - Ambiente configurado para rodar `spark-submit` na linha de comando
 
-No Windows, é necessário ter o binário `winutils.exe` compatível com sua arquitetura colocado em:
-
-```text
-C:\hadoop\bin\winutils.exe
-C:\hadoop\bin\hadoop.dll
-```
-
-> Observação: Caso encontre problemas com `winutils`, a alternativa recomendada 
-> é executar o pipeline em Linux ou WSL, onde o Spark não depende desse binário.
-
 ### 1.2. Estrutura de pastas
 
 ```text
@@ -44,7 +34,8 @@ hiveplace-de-challenge/
 ```
 
 Coloque o arquivo `input.csv` em `data/raw/`.
-Dataset de teste: https://www.kaggle.com/datasets/parisrohan/nyc-taxi-trip-duration?resource=download
+
+> Dataset de teste: https://www.kaggle.com/datasets/parisrohan/nyc-taxi-trip-duration?resource=download 
 
 ### 1.3. Execução do pipeline
 
